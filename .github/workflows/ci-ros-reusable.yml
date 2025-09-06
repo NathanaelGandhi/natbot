@@ -1,0 +1,157 @@
+---
+name: CI ROS Reusable
+
+on: # This determines when this workflow is run
+  workflow_call: # Workflow can be called by another workflow.
+    inputs:
+      ci_ros_matrix:
+        required: true
+        type: string
+
+jobs:
+  triage:
+    name: Triage
+    runs-on: ubuntu-latest
+    outputs:
+      utc_datetime: ${{ steps.get_utc_datetime.outputs.utc_datetime }}
+      repo_name: ${{ steps.get_repo_name.outputs.repo_name }}
+      short_sha: ${{ steps.get_short_sha.outputs.short_sha }}
+      is_protected_branch: ${{ steps.is_protected_branch.outputs.is_protected_branch }}
+    steps:
+      - id: get_utc_datetime
+        run: echo "utc_datetime=$(date -u +%Y%m%dT%H%M%S)" | tee -a "$GITHUB_OUTPUT"
+
+      - id: get_repo_name
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: echo "repo_name=$(echo '$GITHUB_REPOSITORY' | cut -d'/' -f2)" | tee -a "$GITHUB_OUTPUT"
+
+      - id: get_short_sha
+
+        run: echo "short_sha=$(echo $GITHUB_SHA | cut -c 1-7)" | tee -a "$GITHUB_OUTPUT"
+
+      - id: is_protected_branch
+        shell: bash
+        env:
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          # Set true if this branch is a protected branch
+          echo "github.ref=${GITHUB_REF}"
+          echo "github.event_name=${GITHUB_EVENT_NAME}"
+          set -x
+          if [[ (($GITHUB_REF == 'refs/heads/gh-readonly-queue/main/*') || (($GITHUB_EVENT_NAME == 'push' || $GITHUB_EVENT_NAME == 'workflow_dispatch' || $GITHUB_EVENT_NAME == 'merge_group') && ($GITHUB_REF == 'refs/heads/main' || $GITHUB_REF == 'refs/heads/release' || $GITHUB_REF == 'refs/heads/release-beta' || $GITHUB_REF == 'refs/heads/release-candidate'))) ]]; then
+            echo "is_protected_branch=true" | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "is_protected_branch=false" | tee -a "$GITHUB_OUTPUT"
+          fi
+
+  ### END TRIAGE JOB ###############################################################################
+
+  ci_ros:
+    name: ${{ matrix.ros_distro }} ${{ matrix.arch }}
+    needs: triage
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJson(inputs.ci_ros_matrix) }}
+    container:
+      image: ${{ matrix.container }}
+      # credentials: # GH hosted
+      #   username: ${{ github.actor }} # GH hosted
+      #   password: ${{ secrets.github_token }} # GH hosted
+    steps:
+      - id: get_run_description
+        env:
+          REPO_NAME: ${{ needs.triage.outputs.repo_name }}
+          RUN_ID: ${{ github.run_id }}
+          UTC_DATETIME: ${{ needs.triage.outputs.utc_datetime }}
+          SHORT_SHA: ${{ needs.triage.outputs.short_sha }}
+          ROS_DISTRO: ${{ matrix.ros_distro }}
+          ARCH: ${{ matrix.arch }}
+        run: echo "RUN_DESCRIPTION=${REPO_NAME}-${RUN_ID}-${UTC_DATETIME}-${SHORT_SHA}-${ROS_DISTRO}-${ARCH}" | tee -a "$GITHUB_OUTPUT"
+
+      - id: checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          submodules: recursive # Ensures submodules are checked out
+
+      - name: Install dependencies
+        shell: bash
+        env:
+          ROS_DISTRO: ${{ matrix.ros_distro }}
+        run: |
+          if [ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then
+            sudo rosdep init
+          else
+            echo "Skipping rosdep init as /etc/ros/rosdep/sources.list.d/20-default.list found"
+          fi
+          rosdep update
+          rosdep install --from-paths . --ignore-src -y --rosdistro $ROS_DISTRO
+
+      - id: get_colcon_args
+        shell: bash
+        run: |
+          colcon_args=""
+          colcon_build_args="--cmake-force-configure"
+          colcon_test_args="--event-handlers console_cohesion+ --return-code-on-test-failure"
+
+          echo "colcon_build_args=${colcon_args} ${colcon_build_args}" | tee -a "$GITHUB_OUTPUT"
+          echo "colcon_test_args=${colcon_args} ${colcon_test_args}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Build ${{ matrix.ros_distro }} ${{ matrix.arch }}
+        id: build
+        shell: bash
+        env:
+          COLCON_BUILD_ARGS: ${{ steps.get_colcon_args.outputs.colcon_build_args }}
+          ROS_DISTRO: ${{ matrix.ros_distro }}
+        run: |
+          source /opt/ros/${ROS_DISTRO}/setup.bash
+          colcon build $COLCON_BUILD_ARGS
+
+      - name: Test
+        id: test
+        shell: bash
+        env:
+          COLCON_TEST_ARGS: ${{ steps.get_colcon_args.outputs.colcon_test_args }}
+          ROS_DISTRO: ${{ matrix.ros_distro }}
+        run: |
+          source /opt/ros/${ROS_DISTRO}/setup.bash
+          colcon test $COLCON_TEST_ARGS
+
+      - name: Archive artifacts
+        if: ${{ always() }}
+        env:
+          RUN_DESCRIPTION: ${{ steps.get_run_description.outputs.run_description }}
+        run: |
+          # Relative-directory/artifact pair array. Comma delimited pairs. Space separated array items.
+          # Eg. [<dir1>,<archive1> <dir2>,<archive2>]
+          artifact_pairs="
+            log/latest_build,log_latest_build.${RUN_DESCRIPTION}.tar.gz
+            log/latest_test,log_latest_test.${RUN_DESCRIPTION}.tar.gz
+          "
+          for pair in $artifact_pairs; do
+            # Accessing the elements by splitting on the delimiter
+            dir=$(echo $pair | cut -d ',' -f 1)
+            archive=$(echo $pair | cut -d ',' -f 2)
+            if [ ! -d "$dir" ]; then
+              echo "Skipping non-existing \'$dir\' directory"
+              continue
+            fi
+            echo "Archiving \'$dir\' directory as \'$archive\'"
+            tar -czvf $archive -C "$(readlink -f $dir)" .
+          done
+
+      - name: Upload archived artifacts
+        uses: actions/upload-artifact@v4
+        # Note: ACT is not able to upload artifacts
+        if: ${{ always() && !env.ACT }}
+        with:
+          name: artifacts.${{ steps.get_run_description.outputs.run_description }}
+          compression-level: 9 # maximum compression
+          path: |
+            log_latest_build.${{ steps.get_run_description.outputs.run_description }}.tar.gz
+            log_latest_test.${{ steps.get_run_description.outputs.run_description }}.tar.gz
+
+  ### END CI ROS JOB ###############################################################################

@@ -1,0 +1,111 @@
+---
+####################################################################################################
+## This can be run locally using the GitHub Actions CLI extension ACT
+## Note: for GH packages, authenticate GH CLI with read access: `gh auth login -s read:packages`
+# `gh extension install https://github.com/nektos/gh-act`
+# `gh act -s GITHUB_TOKEN="$(gh auth token)" -W ./.github/workflows/ci.yml`
+####################################################################################################
+
+name: CI
+
+on: # This determines when this workflow is run
+  push:
+    branches: [main, release, release-beta, release-candidate]
+  pull_request:
+  workflow_dispatch: # Allow manually starting this workflow
+  merge_group: # Allow merge queues
+
+jobs:
+  triage:
+    name: Triage
+    runs-on: ubuntu-latest
+    outputs:
+      ci_ros_matrix: ${{ steps.generate_ci_ros_matrix.outputs.matrix }}
+    steps:
+      - id: skip_check
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          paths_ignore: '["**/*.md"]' # Default: '[]'
+          # paths: '[]' # Default: '[]'
+          # paths_filter: |
+          #   <my_filter>:
+          #     paths_ignore:
+          #       - '<path-to-skip>'
+          #     paths:
+          #       - '<path-to-not-skip>'
+          cancel_others: 'true' # Default: 'false'
+          # skip_after_successful_duplicate: 'true' # Default: 'true'
+          # do_not_skip: '["workflow_dispatch", "schedule", "merge_group"]' # Default: '["workflow_dispatch", "schedule", "merge_group"]'
+          concurrent_skipping: 'outdated_runs' # Default: 'never'
+
+      - name: Print skip_check outputs
+        run: |
+          echo "should_skip=${{ steps.skip_check.outputs.should_skip }}"
+          echo "paths_result=${{ steps.skip_check.outputs.paths_result }}"
+
+      - id: checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: generate_ci_ros_matrix
+        shell: bash
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          # Generate the CI ROS matrix
+
+          runs_on='"ubuntu-latest"' # GH hosted"
+          # runs_on='{"group":"gh-hosted-larger"}'
+
+          if [[ "$GITHUB_EVENT_NAME" == 'push' ]]; then
+            echo "Push run detected."
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == 'pull_request' ]]; then
+            echo "Pull request run detected."
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]; then
+            echo "Manual run detected."
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == 'schedule' ]]; then
+            echo "Scheduled run detected."
+          fi
+
+          {
+            echo 'matrix<<EOF'
+            echo '{
+              "include": [
+                {
+                  "arch": "amd64",
+                  "container": "ros:rolling",
+                  "ros_distro": "rolling",
+                  "runs_on": '"$runs_on"'
+                }
+              ]
+            }'
+            echo 'EOF'
+          } | tee -a "$GITHUB_OUTPUT"
+
+  ci_ros:
+    name: ROS
+    needs: triage
+    if: ${{ needs.triage.outputs.ci_ros_matrix != '' }}
+    uses: ./.github/workflows/ci-ros-reusable.yml
+    with: # Pass inputs down to the reusable workflow
+      ci_ros_matrix: "${{ needs.triage.outputs.ci_ros_matrix }}"
+    secrets: inherit
+
+  # Target a static job name to query if the required status checks succeeded
+  required_status_checks:
+    name: Required status checks
+    runs-on: ubuntu-latest
+    needs: [triage, ci_ros]
+    if: always()
+    # Guard required status checks via step conditionals
+    steps:
+      - name: Failure
+        if: failure() || ( needs.ci_ros.result == 'failure' && needs.triage.outputs.ci_ros_matrix != '' )
+        run: exit 1
+      - name: Cancelled
+        if: cancelled() || ( needs.ci_ros.result == 'cancelled' && needs.triage.outputs.ci_ros_matrix != '' )
+        run: exit 1
